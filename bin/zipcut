@@ -1,0 +1,124 @@
+#!ruby
+
+require_relative "../lib/zipcut"
+require "fileutils"
+require "find"
+
+using ZipCut::Extensions
+
+require "optparse"
+
+outdir = nil
+depth = nil
+traversedir = false
+trimpath = false
+excludes = []
+verbose = 1
+
+OptionParser.new(<<-SUMMARY, 12, " ").instance_exec do
+Usage: #{File.basename $0} [switches...] zipfiles...
+  SUMMARY
+  on("-C outdir", "change output based directory") { |x| outdir = x }
+  on("-r", "directory recursible mode") { traversedir = true }
+  on("-d depth", "change directory level in zip (range: 1..20) (INITIAL: auto)", /\A(?:\d+|auto)\z/i) { |x| depth = x.casecmp("auto") == 0 ? nil : x.to_i }
+  on("-X pattern", "exclude file name pattern (can be multiples)", /\A(?![\*\/]+\z).+\z/) { |x| excludes << x }
+  on("-T", "Trim leading directory path") { trimpath = true }
+  on("-v", "verbose mode (given multiple times to inclease verbosery level) (INITIAL: 1)") { verbose += 1 }
+  on("-q", "quiet mode (set verbosery level to zero)") { verbose += 1 }
+  on("--debug", "switch to debug mode") { $-d = true }
+
+  order!
+
+  if ARGV.empty?
+    $stderr.puts help
+    exit 1
+  end
+end
+
+excludes.map! { |e| ZipCut.glob_to_regexp(e) }
+if excludes.empty?
+  excludes = nil
+else
+  excludes = Regexp.union(excludes)
+end
+
+if depth
+  path_cut = %r(\A((?:/?[^/]+(?=/)){#{depth}})/)
+end
+
+if traversedir
+  ARGV.map! do |d|
+    Find.find(d).select { |e| File.file?(e) && File.open(e, "rb") { |f| f.read(4) == "PK\x03\x04" } }
+  end
+
+  ARGV.flatten!
+end
+
+current_index = nil
+current_path = nil
+trap(:INFO) { $stderr.puts "%s: [%d / %d] %s\n" % [File.basename($0), current_index + 1, ARGV.size, current_path] if current_path }
+
+err = false
+ARGV.each_with_index do |zippath, i|
+  current_index = i
+  current_path = zippath
+
+  begin
+    unless depth
+      prefix = nil
+      Zip::File.open(zippath) do |z|
+        z.each do |e|
+          next unless e.file? && e.general_name[-1] != "/"
+          x = e.general_name
+          x = x.split("/")
+          x.pop
+          next if x == prefix
+          if prefix
+            x = prefix.zip(x)
+            prefix = []
+            x.each { |(a, b)| if a == b; prefix << a; else; break; end; }
+          else
+            prefix = x
+          end
+        end
+      end
+
+      if prefix
+        d = prefix.size + 1
+      else
+        d = 0
+      end
+
+      path_cut = %r(\A((?:/?[^/]+(?=/)){#{d}})/)
+    end
+
+    puts "[%d / %d] %s\n" % [current_index + 1, ARGV.size, current_path]
+
+    ZipCut(zippath, outdir: outdir) do |path, entry|
+      path1 = path.sub(path_cut, "")
+      dir = $1
+      if (dir.nil? || dir.empty?) || path1.empty? || path =~ excludes
+        ZipCut.entry nil, path
+      else
+        ZipCut.entry dir, path1
+      end
+    end
+  rescue Interrupt
+    exit 1
+  rescue Exception
+    err = true
+
+    if $-d
+      $stderr.puts <<-ERR
+#$0: #{zippath.inspect}
+#{$@.join("\n\t").sub(/$/) { ": #$! (#{$!.class})" }}
+      ERR
+    else
+      $stderr.puts <<-ERR
+#{zippath}: #$! (#{$!.class})
+      ERR
+    end
+  end
+end
+
+exit (err ? 1 : 0)

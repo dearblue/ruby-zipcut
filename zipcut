@@ -1,0 +1,3 @@
+#!/bin/sh
+
+ruby -Ilib "bin/`basename $0`" "$@"
